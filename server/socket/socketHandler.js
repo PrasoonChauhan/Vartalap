@@ -5,8 +5,127 @@ const User = require('../models/User');
 
 // Map: userId -> socketId
 const onlineUsers = new Map();
-// Map: roomId -> { participants, mode, startTime }
+// Map: roomId -> { participants, mode, startTime, warningTimer, endTimer }
 const activeRooms = new Map();
+
+const MAX_CALL_DURATION_MS = 60 * 60 * 1000; // 60 minutes
+const WARNING_BEFORE_END_MS = 5 * 60 * 1000;  // warn at 55 minutes (5 min before end)
+
+// Helper: schedule the 55-min warning and 60-min auto-end timers for a room
+function scheduleCallTimers(io, roomId, room) {
+  // Clear any existing timers (idempotent)
+  if (room.warningTimer) clearTimeout(room.warningTimer);
+  if (room.endTimer) clearTimeout(room.endTimer);
+
+  const elapsed = Date.now() - new Date(room.startTime).getTime();
+  const warningDelay = MAX_CALL_DURATION_MS - WARNING_BEFORE_END_MS - elapsed;
+  const endDelay = MAX_CALL_DURATION_MS - elapsed;
+
+  // If already past the end time, end immediately
+  if (endDelay <= 0) {
+    triggerAutoEnd(io, roomId);
+    return;
+  }
+
+  // Schedule warning (only if still in the future)
+  if (warningDelay > 0) {
+    room.warningTimer = setTimeout(() => {
+      const currentRoom = activeRooms.get(roomId);
+      if (currentRoom) {
+        console.log(`⏰ 55-min warning for room ${roomId}`);
+        io.to(roomId).emit('call:time-warning', {
+          roomId,
+          message: 'This call will end in 5 minutes.',
+          remainingSeconds: 300,
+        });
+      }
+    }, warningDelay);
+  }
+
+  // Schedule auto-end
+  room.endTimer = setTimeout(() => {
+    triggerAutoEnd(io, roomId);
+  }, endDelay);
+
+  console.log(`⏱️ Call timers set for room ${roomId}: warning in ${Math.round(warningDelay / 1000)}s, end in ${Math.round(endDelay / 1000)}s`);
+}
+
+// Helper: auto-end a call (reuses the same logic as call:end)
+async function triggerAutoEnd(io, roomId) {
+  const room = activeRooms.get(roomId);
+  if (!room) return;
+
+  console.log(`⏰ Auto-ending call for room ${roomId} (60-min limit reached)`);
+
+  // Calculate duration
+  const duration = Math.floor((Date.now() - new Date(room.startTime).getTime()) / 1000);
+
+  // Save call record
+  try {
+    const uniqueParticipantIds = [...new Set(room.participants.map((p) => p.userId || p))];
+    const participantDocs = await User.find({ _id: { $in: uniqueParticipantIds } }).select('username avatar');
+    await CallRecord.create({
+      roomId,
+      participants: participantDocs.map((u) => ({
+        userId: u._id,
+        username: u.username,
+        avatar: u.avatar,
+      })),
+      startTime: room.startTime,
+      endTime: new Date(),
+      duration,
+    });
+
+    // Update recent contacts for all participants
+    for (const pid of uniqueParticipantIds) {
+      const otherIds = uniqueParticipantIds.filter((id) => id !== pid);
+      if (otherIds.length > 0) {
+        const others = await User.find({ _id: { $in: otherIds } }).select('username avatar');
+        const user = await User.findById(pid);
+        if (user) {
+          for (const other of others) {
+            const existing = user.recentContacts.find(
+              (c) => c.userId && c.userId.toString() === other._id.toString()
+            );
+            if (existing) {
+              existing.lastCallAt = new Date();
+              existing.avatar = other.avatar;
+            } else {
+              user.recentContacts.push({
+                userId: other._id,
+                username: other.username,
+                avatar: other.avatar,
+                lastCallAt: new Date(),
+              });
+            }
+          }
+          user.recentContacts = user.recentContacts
+            .sort((a, b) => new Date(b.lastCallAt) - new Date(a.lastCallAt))
+            .slice(0, 20);
+          await user.save();
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Error saving call record (auto-end):', err);
+  }
+
+  // Delete all chat messages for this room
+  try {
+    await Message.deleteMany({ roomId });
+  } catch (err) {
+    console.error('Error deleting chat messages (auto-end):', err);
+  }
+  io.to(roomId).emit('chat:clear', { roomId });
+
+  // Notify everyone in room that call ended (include autoEnded flag)
+  io.to(roomId).emit('call:ended', { roomId, duration, autoEnded: true });
+
+  // Clear timers and cleanup
+  if (room.warningTimer) clearTimeout(room.warningTimer);
+  if (room.endTimer) clearTimeout(room.endTimer);
+  activeRooms.delete(roomId);
+}
 
 const socketHandler = (io) => {
   io.on('connection', (socket) => {
@@ -30,11 +149,17 @@ const socketHandler = (io) => {
     // ─── CALL: INITIATE ──────────────────────────────────────────
     socket.on('call:initiate', ({ callerId, callerName, callerAvatar, targetIds, roomId }) => {
       console.log(`📞 call:initiate by ${callerName} (${callerId}) for room ${roomId}`);
-      activeRooms.set(roomId, {
+      const room = {
         participants: [],
         startTime: new Date(),
         hostId: callerId?.toString(),
-      });
+        warningTimer: null,
+        endTimer: null,
+      };
+      activeRooms.set(roomId, room);
+
+      // Schedule the 55-min warning and 60-min auto-end timers
+      scheduleCallTimers(io, roomId, room);
 
       // Notify each target
       targetIds.forEach((targetId) => {
@@ -73,8 +198,13 @@ const socketHandler = (io) => {
           participants: [],
           startTime: new Date(),
           hostId: uid,
+          warningTimer: null,
+          endTimer: null,
         };
         activeRooms.set(roomId, room);
+
+        // Schedule timers for newly created room
+        scheduleCallTimers(io, roomId, room);
       }
 
       socket.join(roomId);
@@ -102,8 +232,10 @@ const socketHandler = (io) => {
 
       console.log(`📋 Existing participants for ${username} (${socket.id}):`, existingParticipants);
 
-      // Send list of existing participants to the joiner
-      socket.emit('call:existing-participants', existingParticipants);
+      // Send list of existing participants to the joiner (include startTime for timer sync)
+      socket.emit('call:existing-participants', existingParticipants, {
+        startTime: room.startTime.toISOString(),
+      });
 
       // Broadcast new joiner to everyone else in the room
       console.log(`📢 Broadcasting call:user-joined for ${username} (${socket.id}) to room ${roomId}`);
@@ -127,6 +259,10 @@ const socketHandler = (io) => {
     socket.on('call:end', async ({ roomId, userId }) => {
       const room = activeRooms.get(roomId);
       if (!room) return;
+
+      // Clear scheduled timers (prevent duplicate auto-end after manual end)
+      if (room.warningTimer) clearTimeout(room.warningTimer);
+      if (room.endTimer) clearTimeout(room.endTimer);
 
       // Calculate duration
       const duration = Math.floor((new Date() - room.startTime) / 1000);
@@ -210,11 +346,12 @@ const socketHandler = (io) => {
     });
 
     // ─── WEBRTC SIGNALING ─────────────────────────────────────────
-    socket.on('call:media-toggle', ({ roomId, isMuted, isCameraOff }) => {
+    socket.on('call:media-toggle', ({ roomId, isMuted, isCameraOff, isBackgrounded }) => {
       socket.to(roomId).emit('call:media-toggle', {
         socketId: socket.id,
         isMuted,
         isCameraOff,
+        isBackgrounded,
       });
     });
 

@@ -55,7 +55,7 @@ const MessageBubble = ({ message, isOwn }) => (
 );
 
 
-const ChatPanel = ({ socket, roomId, onClose }) => {
+const ChatPanel = ({ socket, roomId, onClose, isMobile = false }) => {
   const { user } = useAuth();
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState('');
@@ -136,9 +136,9 @@ const ChatPanel = ({ socket, roomId, onClose }) => {
 
   return (
     <motion.div
-      initial={{ x: 320, opacity: 0 }}
-      animate={{ x: 0, opacity: 1 }}
-      exit={{ x: 320, opacity: 0 }}
+      initial={isMobile ? { y: '100%', opacity: 0 } : { x: 320, opacity: 0 }}
+      animate={isMobile ? { y: 0, opacity: 1 } : { x: 0, opacity: 1 }}
+      exit={isMobile ? { y: '100%', opacity: 0 } : { x: 320, opacity: 0 }}
       transition={{ type: 'spring', stiffness: 300, damping: 30 }}
       style={{ height: '100%', display: 'flex', flexDirection: 'column' }}
     >
@@ -147,7 +147,8 @@ const ChatPanel = ({ socket, roomId, onClose }) => {
         background: 'rgba(19,19,26,0.95)',
         backdropFilter: 'blur(20px)',
         border: '1px solid rgba(255,255,255,0.06)',
-        borderRadius: 3, overflow: 'hidden',
+        borderRadius: isMobile ? '16px 16px 0 0' : 3,
+        overflow: 'hidden',
       }}>
         {/* Header */}
         <Box sx={{

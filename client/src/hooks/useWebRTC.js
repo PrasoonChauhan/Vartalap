@@ -19,6 +19,7 @@ const useWebRTC = (socket, user, roomId) => {
   const localStreamRef = useRef(null);
   const screenStreamRef = useRef(null);
   const initializedRef = useRef(false);
+  const roomIdRef = useRef(null); // Track which room listeners belong to
 
   // Get local media
   const getLocalStream = useCallback(async () => {
@@ -140,16 +141,9 @@ const useWebRTC = (socket, user, roomId) => {
     return pc;
   }, [socket]);
 
-  // Initialize WebRTC for the room
-  const initializeWebRTC = useCallback(async () => {
-    if (!socket || !user || !roomId) return;
-    if (initializedRef.current) return;
-    initializedRef.current = true;
-
-    console.log('🚀 Initializing WebRTC for room:', roomId, 'User:', user.username, 'Socket:', socket.id);
-    const stream = await getLocalStream();
-
-    // Clean old listeners
+  // Remove all socket listeners for call/webrtc events
+  const removeSocketListeners = useCallback(() => {
+    if (!socket) return;
     socket.off('call:existing-participants');
     socket.off('call:user-joined');
     socket.off('webrtc:offer');
@@ -157,9 +151,31 @@ const useWebRTC = (socket, user, roomId) => {
     socket.off('webrtc:ice-candidate');
     socket.off('call:user-left');
     socket.off('call:media-toggle');
+  }, [socket]);
+
+  // Initialize WebRTC for the room
+  const initializeWebRTC = useCallback(async () => {
+    if (!socket || !user || !roomId) return;
+
+    // If already initialized for THIS room, skip
+    if (initializedRef.current && roomIdRef.current === roomId) return;
+
+    // If initialized for a DIFFERENT room (stale), clean listeners first
+    if (initializedRef.current && roomIdRef.current !== roomId) {
+      removeSocketListeners();
+    }
+
+    initializedRef.current = true;
+    roomIdRef.current = roomId;
+
+    console.log('🚀 Initializing WebRTC for room:', roomId, 'User:', user.username, 'Socket:', socket.id);
+    const stream = await getLocalStream();
+
+    // Clean old listeners before attaching new ones
+    removeSocketListeners();
 
     // Handle remote media status toggling
-    socket.on('call:media-toggle', ({ socketId, isMuted: remoteMuted, isCameraOff: remoteCameraOff }) => {
+    socket.on('call:media-toggle', ({ socketId, isMuted: remoteMuted, isCameraOff: remoteCameraOff, isBackgrounded: remoteBackgrounded }) => {
       setPeers((prev) => {
         if (!prev[socketId]) return prev;
         return {
@@ -168,6 +184,7 @@ const useWebRTC = (socket, user, roomId) => {
             ...prev[socketId],
             isMuted: remoteMuted !== undefined ? remoteMuted : prev[socketId].isMuted,
             isCameraOff: remoteCameraOff !== undefined ? remoteCameraOff : prev[socketId].isCameraOff,
+            isBackgrounded: remoteBackgrounded !== undefined ? remoteBackgrounded : prev[socketId].isBackgrounded,
           },
         };
       });
@@ -175,6 +192,8 @@ const useWebRTC = (socket, user, roomId) => {
 
     // 1. When joiner gets existing participants from room
     socket.on('call:existing-participants', async (existingParticipants) => {
+      // Guard: only process if still in the same room
+      if (roomIdRef.current !== roomId) return;
       console.log('📥 call:existing-participants:', existingParticipants);
       for (const { userId: targetUserId, username: targetUsername, avatar: targetAvatar, socketId: targetSocketId } of existingParticipants) {
         const pc = createPeer(targetSocketId, targetUserId, targetUsername, targetAvatar, stream);
@@ -191,12 +210,14 @@ const useWebRTC = (socket, user, roomId) => {
 
     // 2. When existing participant receives a new joiner
     socket.on('call:user-joined', ({ userId, username, avatar, socketId }) => {
+      if (roomIdRef.current !== roomId) return;
       console.log('📥 call:user-joined:', socketId, username);
       createPeer(socketId, userId, username, avatar, stream);
     });
 
     // 3. WebRTC Offer received
     socket.on('webrtc:offer', async ({ offer, callerId, callerSocketId }) => {
+      if (roomIdRef.current !== roomId) return;
       console.log('📥 webrtc:offer received from:', callerSocketId);
       const pc = createPeer(callerSocketId, callerId, '', '', stream);
       try {
@@ -212,6 +233,7 @@ const useWebRTC = (socket, user, roomId) => {
 
     // 4. WebRTC Answer received
     socket.on('webrtc:answer', async ({ answer, answererSocketId }) => {
+      if (roomIdRef.current !== roomId) return;
       console.log('📥 webrtc:answer received from:', answererSocketId);
       const peerObj = peersRef.current[answererSocketId];
       if (peerObj?.pc) {
@@ -237,6 +259,7 @@ const useWebRTC = (socket, user, roomId) => {
 
     // 6. User left
     socket.on('call:user-left', ({ socketId }) => {
+      if (roomIdRef.current !== roomId) return;
       console.log('📥 call:user-left for:', socketId);
       if (peersRef.current[socketId]) {
         peersRef.current[socketId].pc.close();
@@ -257,7 +280,7 @@ const useWebRTC = (socket, user, roomId) => {
       username: user.username,
       avatar: user.avatar,
     });
-  }, [socket, user, roomId, getLocalStream, createPeer]);
+  }, [socket, user, roomId, getLocalStream, createPeer, removeSocketListeners]);
 
   // Mute / unmute
   const toggleMute = useCallback(() => {
@@ -322,9 +345,36 @@ const useWebRTC = (socket, user, roomId) => {
     }
   }, [isScreenSharing]);
 
-  // Cleanup
+  // Pause video (for back button - keep connections alive, disable video track)
+  const pauseVideo = useCallback(() => {
+    if (localStreamRef.current) {
+      localStreamRef.current.getVideoTracks().forEach((track) => {
+        track.enabled = false;
+      });
+      setIsCameraOff(true);
+      if (socket && roomId) {
+        socket.emit('call:media-toggle', { roomId, isMuted, isCameraOff: true, isBackgrounded: true });
+      }
+    }
+  }, [socket, roomId, isMuted]);
+
+  // Resume video (when returning to call screen)
+  const resumeVideo = useCallback(() => {
+    if (localStreamRef.current) {
+      localStreamRef.current.getVideoTracks().forEach((track) => {
+        track.enabled = true;
+      });
+      setIsCameraOff(false);
+      if (socket && roomId) {
+        socket.emit('call:media-toggle', { roomId, isMuted, isCameraOff: false, isBackgrounded: false });
+      }
+    }
+  }, [socket, roomId, isMuted]);
+
+  // Full cleanup (only on explicit End Call)
   const cleanup = useCallback(() => {
     initializedRef.current = false;
+    roomIdRef.current = null;
     Object.values(peersRef.current).forEach(({ pc }) => pc.close());
     peersRef.current = {};
     localStreamRef.current?.getTracks().forEach((t) => t.stop());
@@ -335,14 +385,8 @@ const useWebRTC = (socket, user, roomId) => {
     setLocalStream(null);
     setIsScreenSharing(false);
 
-    socket?.off('call:existing-participants');
-    socket?.off('call:user-joined');
-    socket?.off('call:user-left');
-    socket?.off('webrtc:offer');
-    socket?.off('webrtc:answer');
-    socket?.off('webrtc:ice-candidate');
-    socket?.off('call:media-toggle');
-  }, [socket]);
+    removeSocketListeners();
+  }, [removeSocketListeners]);
 
   return {
     localStream,
@@ -354,6 +398,8 @@ const useWebRTC = (socket, user, roomId) => {
     toggleMute,
     toggleCamera,
     toggleScreenShare,
+    pauseVideo,
+    resumeVideo,
     cleanup,
   };
 };

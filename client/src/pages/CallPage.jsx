@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
-import { Box, Typography, Chip, Snackbar, Alert } from '@mui/material';
+import { Box, Typography, Chip, Snackbar, Alert, useMediaQuery } from '@mui/material';
 import { DeleteSweepRounded } from '@mui/icons-material';
 import { useParams, useNavigate } from 'react-router-dom';
 import { AnimatePresence } from 'framer-motion';
@@ -17,7 +17,8 @@ const CallPage = () => {
   const navigate = useNavigate();
   const { user } = useAuth();
   const { socket } = useSocket();
-  const { endCall, leaveCall } = useCall();
+  const { endCall, callState, currentRoom, backgroundCall, foregroundCall } = useCall();
+  const isMobile = useMediaQuery('(max-width:768px)');
 
   const [isChatOpen, setIsChatOpen] = useState(false);
   const [isParticipantsOpen, setIsParticipantsOpen] = useState(false);
@@ -29,14 +30,26 @@ const CallPage = () => {
     isMuted, isCameraOff, isScreenSharing,
     initializeWebRTC,
     toggleMute, toggleCamera, toggleScreenShare,
+    pauseVideo, resumeVideo,
     cleanup,
   } = useWebRTC(socket, user, roomId);
 
   const mountedRef = useRef(false);
+  const explicitEndRef = useRef(false); // tracks whether End Call was clicked
+  const autoEndTimerRef = useRef(null); // local backup timer for auto-end
 
-  // Initialize WebRTC on mount
+  // Initialize WebRTC on mount / re-entry from backgrounded state
   useEffect(() => {
-    if (socket && user && roomId && !mountedRef.current) {
+    if (!socket || !user || !roomId) return;
+
+    if (callState === 'backgrounded') {
+      // Returning from background — resume video
+      foregroundCall();
+      resumeVideo();
+      return;
+    }
+
+    if (!mountedRef.current) {
       mountedRef.current = true;
       initializeWebRTC().catch((err) => {
         console.error('Failed to access media:', err);
@@ -44,49 +57,81 @@ const CallPage = () => {
       });
     }
 
+    // Cleanup on unmount: only pause video (Back button), NOT full cleanup
+    // Full cleanup only happens on explicit End Call
     return () => {
-      cleanup();
+      if (!explicitEndRef.current) {
+        // Back button pressed — background the call, don't end it
+        pauseVideo();
+        backgroundCall();
+        mountedRef.current = false;
+      }
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [socket, user, roomId]);
 
-  // Listen for call end from remote
+  // Listen for call end from remote, time warnings, and startTime sync
   useEffect(() => {
     if (!socket) return;
 
-    socket.on('call:ended', ({ roomId: endedRoom, duration }) => {
+    const handleCallEnded = ({ roomId: endedRoom, duration, autoEnded }) => {
       if (endedRoom === roomId) {
+        if (autoEndTimerRef.current) clearTimeout(autoEndTimerRef.current);
         cleanup();
         setCallEnded(true);
-        const msg = `✅ Call ended — Chat messages deleted (${Math.floor(duration / 60)}m ${duration % 60}s)`;
+        mountedRef.current = false;
+        const timeStr = `${Math.floor(duration / 60)}m ${duration % 60}s`;
+        const msg = autoEnded
+          ? `⏰ Call auto-ended — 60-minute limit reached (${timeStr})`
+          : `✅ Call ended — Chat messages deleted (${timeStr})`;
         setSnackbar({ open: true, message: msg, severity: 'info' });
         setTimeout(() => navigate('/'), 3000);
       }
-    });
+    };
 
-    socket.on('call:user-left', ({ username }) => {
+    const handleTimeWarning = ({ roomId: warnRoom, message }) => {
+      if (warnRoom === roomId) {
+        setSnackbar({ open: true, message: `⏰ ${message}`, severity: 'warning' });
+      }
+    };
+
+    const handleUserLeft = ({ username }) => {
       setSnackbar({ open: true, message: `${username || 'User'} left the call`, severity: 'info' });
-    });
+    };
 
-    socket.on('call:rejected', ({ username }) => {
+    const handleRejected = ({ username }) => {
       setSnackbar({ open: true, message: `🚫 Call declined by ${username || 'user'}`, severity: 'warning' });
       setTimeout(() => navigate('/'), 2500);
-    });
+    };
+
+    socket.on('call:ended', handleCallEnded);
+    socket.on('call:time-warning', handleTimeWarning);
+    socket.on('call:user-left', handleUserLeft);
+    socket.on('call:rejected', handleRejected);
 
     return () => {
-      socket.off('call:ended');
-      socket.off('call:user-left');
-      socket.off('call:rejected');
+      socket.off('call:ended', handleCallEnded);
+      socket.off('call:time-warning', handleTimeWarning);
+      socket.off('call:user-left', handleUserLeft);
+      socket.off('call:rejected', handleRejected);
     };
   }, [socket, roomId, navigate, cleanup]);
 
+  // Explicit End Call (user clicks the button)
   const handleEndCall = useCallback(() => {
+    if (autoEndTimerRef.current) clearTimeout(autoEndTimerRef.current);
+    explicitEndRef.current = true;
     cleanup();
     endCall(roomId);
+    mountedRef.current = false;
     setSnackbar({ open: true, message: '✅ Call ended — Chat messages deleted', severity: 'info' });
     setTimeout(() => navigate('/'), 2500);
   }, [cleanup, endCall, roomId, navigate]);
 
   const participantCount = 1 + Object.keys(peers).length;
+
+  // On mobile, hide call controls when chat is open
+  const showCallControls = !(isMobile && isChatOpen);
 
   return (
     <Box sx={{
@@ -135,9 +180,9 @@ const CallPage = () => {
           />
         </Box>
 
-        {/* Side panels (Chat or Participants) */}
+        {/* Side panels (Chat or Participants) — desktop only */}
         <AnimatePresence>
-          {isChatOpen && (
+          {isChatOpen && !isMobile && (
             <Box sx={{ width: 320, p: 1.5, flexShrink: 0, height: '100%', zIndex: 20 }}>
               <ChatPanel
                 socket={socket}
@@ -161,35 +206,56 @@ const CallPage = () => {
         </AnimatePresence>
       </Box>
 
-      {/* Controls bar */}
-      <Box sx={{
-        position: 'absolute', bottom: 24, left: 0, right: 0,
-        display: 'flex', justifyContent: 'center', zIndex: 50,
-        pointerEvents: 'none',
-      }}>
-        <Box sx={{ pointerEvents: 'auto' }}>
-          <CallControls
-            isMuted={isMuted}
-            isCameraOff={isCameraOff}
-            isScreenSharing={isScreenSharing}
-            isChatOpen={isChatOpen}
-            isParticipantsOpen={isParticipantsOpen}
-            participantCount={participantCount}
-            onMute={toggleMute}
-            onCamera={toggleCamera}
-            onScreenShare={toggleScreenShare}
-            onChat={() => {
-              setIsChatOpen((prev) => !prev);
-              setIsParticipantsOpen(false);
-            }}
-            onParticipants={() => {
-              setIsParticipantsOpen((prev) => !prev);
-              setIsChatOpen(false);
-            }}
-            onEnd={handleEndCall}
-          />
+      {/* Mobile chat overlay — full width bottom sheet */}
+      <AnimatePresence>
+        {isChatOpen && isMobile && (
+          <Box sx={{
+            position: 'absolute',
+            bottom: 0, left: 0, right: 0,
+            height: '60vh',
+            zIndex: 60,
+          }}>
+            <ChatPanel
+              socket={socket}
+              roomId={roomId}
+              onClose={() => setIsChatOpen(false)}
+              isMobile={true}
+            />
+          </Box>
+        )}
+      </AnimatePresence>
+
+      {/* Controls bar — hidden on mobile when chat is open */}
+      {showCallControls && (
+        <Box sx={{
+          position: 'absolute', bottom: 24, left: 0, right: 0,
+          display: 'flex', justifyContent: 'center', zIndex: 50,
+          pointerEvents: 'none',
+        }}>
+          <Box sx={{ pointerEvents: 'auto' }}>
+            <CallControls
+              isMuted={isMuted}
+              isCameraOff={isCameraOff}
+              isScreenSharing={isScreenSharing}
+              isChatOpen={isChatOpen}
+              isParticipantsOpen={isParticipantsOpen}
+              participantCount={participantCount}
+              onMute={toggleMute}
+              onCamera={toggleCamera}
+              onScreenShare={toggleScreenShare}
+              onChat={() => {
+                setIsChatOpen((prev) => !prev);
+                setIsParticipantsOpen(false);
+              }}
+              onParticipants={() => {
+                setIsParticipantsOpen((prev) => !prev);
+                setIsChatOpen(false);
+              }}
+              onEnd={handleEndCall}
+            />
+          </Box>
         </Box>
-      </Box>
+      )}
 
       {/* Snackbar notifications */}
       <Snackbar

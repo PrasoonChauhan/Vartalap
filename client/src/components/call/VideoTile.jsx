@@ -3,7 +3,8 @@ import { Box, Avatar, Typography, Chip } from '@mui/material';
 import { MicOff, VideocamOff, ScreenShare } from '@mui/icons-material';
 import { motion } from 'framer-motion';
 
-const VideoTile = ({ stream, username, avatar, isMuted, isCameraOff, isLocal, isScreenSharing }) => {
+const VideoTile = ({ stream, username, avatar, isMuted, isCameraOff, isLocal, isScreenSharing, isBackgrounded }) => {
+  const showVideo = stream && !isCameraOff && !isBackgrounded;
   const videoRef = useRef(null);
 
   useEffect(() => {
@@ -40,12 +41,12 @@ const VideoTile = ({ stream, username, avatar, isMuted, isCameraOff, isLocal, is
             width: '100%', height: '100%',
             objectFit: isScreenSharing ? 'contain' : 'cover',
             transform: isLocal && !isScreenSharing ? 'scaleX(-1)' : 'none',
-            display: stream && !isCameraOff ? 'block' : 'none',
+            display: showVideo ? 'block' : 'none',
           }}
         />
 
         {/* Avatar fallback when camera off or no stream */}
-        {(!stream || isCameraOff) && (
+        {!showVideo && (
           <Box sx={{
             width: '100%', height: '100%',
             display: 'flex', alignItems: 'center', justifyContent: 'center',
